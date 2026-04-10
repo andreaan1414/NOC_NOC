@@ -116,18 +116,13 @@ module mesh_tile #(
     input  wire [33:0] north_in, south_in, east_in, west_in,
     output wire [33:0] north_out, south_out, east_out, west_out,
     input  wire [33:0] ne_in, nw_in, se_in, sw_in,
-    
+
     output wire [33:0] ne_out, nw_out, se_out, sw_out,
 
     // Readback port (tied off at chip_core in tapeout — always inactive)
     input  wire [9:0]  rd_addr,
     input  wire        rd_req,
     output wire [7:0]  rd_data
-
-
-
-
-
 );
 
     wire [31:0] wb_adr, wb_dat_c2r, wb_dat_r2c;
@@ -139,70 +134,75 @@ module mesh_tile #(
     wire       sram_wen, sram_ren;
 
     // -----------------------------------------------------------------------
-    // Address pipeline registers
-    // -----------------------------------------------------------------------
-    // The GF180 SRAM is fully synchronous: it captures address and control
-    // signals on the RISING edge of CLK (when CEN=0), then presents read data
-    // after an internal access time ta=45ns — well within the 60ns cycle.
-    //
-    // subservient drives ALL of its SRAM outputs (sram_raddr, sram_waddr,
-    // sram_wdata, sram_wen, sram_ren) as REGISTERED signals: they are stable
-    // AFTER a posedge and hold steady until the next posedge.
-    //
-    // Timeline WITHOUT registering (broken):
-    //   posedge N-1 : subservient registers new raddr=ADDR_X
-    //   [combinatorial settling after posedge N-1]
-    //   posedge N   : SRAM captures final_a — but final_a = ADDR_X has only
-    //                 just settled; SRAM sees whatever was on the bus BEFORE
-    //                 the combinatorial path settled (setup violation risk),
-    //                 or worse, captures ADDR_X-1 from the previous cycle.
-    //   posedge N+1 : subservient reads i_sram_rdata expecting mem[ADDR_X]
-    //                 but gets mem[previous address] — WRONG DATA.
-    //
-    // Timeline WITH registering (correct):
-    //   posedge N-1 : subservient registers raddr=ADDR_X.
-    //   posedge N   : our register captures ADDR_X → reg_raddr=ADDR_X.
-    //                 SRAM sees reg_raddr=ADDR_X at posedge N and captures it.
-    //                 (ADDR_X has been stable since shortly after posedge N-1,
-    //                  giving the full cycle as setup time — no violations.)
-    //   posedge N+1 : subservient reads i_sram_rdata = mem[ADDR_X]. ✓
-    //
-    // The same skew affects write address, write data, and write enable.
-    // All four signals are registered here for identical reasons.
-    //
-    // -----------------------------------------------------------------------
     // CEN startup-pulse generator
     // -----------------------------------------------------------------------
-    // The GF180 SRAM model requires CEN to perform a HIGH→LOW transition to
-    // arm its internal cen_fell flag before any operation is accepted.
-    // After that transition CEN is held LOW permanently (synchronous mode).
-    //
     reg boot_mode_q;
     always @(posedge clk or posedge rst)
         if (rst) boot_mode_q <= 1'b1;
         else     boot_mode_q <= boot_mode;
 
-    // One-cycle HIGH pulse on the clock edge where boot_mode falls.
     wire cpu_sram_init_pulse = boot_mode_q & ~boot_mode;
 
     // -----------------------------------------------------------------------
     // Address / Data MUX
     // -----------------------------------------------------------------------
-    // Boot mode : use raw bootloader signals (the bootloader is slow enough
-    //             that its address/data are stable well before the clock edge).
-    // CPU mode  : bypass the extra register to provide 1-cycle latency.
-    wire [9:0] final_a = boot_mode ? boot_addr  : (sram_wen ? sram_waddr : sram_raddr);
-    wire [7:0] final_d = boot_mode ? boot_data  : sram_wdata;
+    wire [9:0] final_a = boot_mode ? boot_addr : (sram_wen ? sram_waddr : sram_raddr);
+    wire [7:0] final_d = boot_mode ? boot_data : sram_wdata;
 
     // -----------------------------------------------------------------------
     // SRAM control
     // -----------------------------------------------------------------------
-    // Boot  : CEN pulses LOW per byte write (boot_wen active-LOW).
-    // CPU   : CEN=HIGH for init-pulse cycle, then permanently LOW.
     wire sram_active = boot_mode ? ~boot_wen : ~cpu_sram_init_pulse;
+    wire sram_write  = boot_mode ? ~boot_wen : sram_wen;
 
-    // GWEN (active-LOW): asserted during writes only.
-    wire sram_write = boot_mode ? ~boot_wen : sram_wen;
+    // -----------------------------------------------------------------------
+    // Dual 512x8 bank — address bit[9] selects hi/lo bank
+    // sram_lo: addresses 0x000-0x1FF (bank_sel=0)
+    // sram_hi: addresses 0x200-0x3FF (bank_sel=1)
+    // -----------------------------------------------------------------------
+    wire        bank_sel  = final_a[9];
+    wire [8:0]  bank_addr = final_a[8:0];
+
+    // Per-bank chip enable (active-low)
+    wire cen_lo = ~(sram_active & ~bank_sel);
+    wire cen_hi = ~(sram_active &  bank_sel);
+
+    // Register bank_sel to align with SRAM output (synchronous read)
+    reg bank_sel_q;
+    always @(posedge clk) bank_sel_q <= bank_sel;
+
+    wire [7:0] sram_lo_q, sram_hi_q;
+    assign sram_rdata = bank_sel_q ? sram_hi_q : sram_lo_q;
+
+    // -----------------------------------------------------------------------
+    // GF180 512x8 SRAM — low bank (0x000-0x1FF)
+    // -----------------------------------------------------------------------
+    gf180mcu_fd_ip_sram__sram512x8m8wm1 sram_lo (
+        .CLK (clk),
+        .CEN (cen_lo),
+        .GWEN(~sram_write),
+        .WEN (8'b0),
+        .A   (bank_addr),
+        .D   (final_d),
+        .Q   (sram_lo_q),
+        .VDD (),
+        .VSS ()
+    );
+
+    // -----------------------------------------------------------------------
+    // GF180 512x8 SRAM — high bank (0x200-0x3FF)
+    // -----------------------------------------------------------------------
+    gf180mcu_fd_ip_sram__sram512x8m8wm1 sram_hi (
+        .CLK (clk),
+        .CEN (cen_hi),
+        .GWEN(~sram_write),
+        .WEN (8'b0),
+        .A   (bank_addr),
+        .D   (final_d),
+        .Q   (sram_hi_q),
+        .VDD (),
+        .VSS ()
+    );
 
     // -----------------------------------------------------------------------
     // Subservient RISC-V core
@@ -218,26 +218,12 @@ module mesh_tile #(
         .o_sram_ren  (sram_ren),
         .o_wb_adr    (wb_adr),
         .o_wb_dat    (wb_dat_c2r),
+        .o_wb_sel    (wb_sel),
         .i_wb_rdt    (wb_dat_r2c),
         .o_wb_we     (wb_we),
         .o_wb_stb    (wb_stb),
         .i_wb_ack    (wb_ack),
         .i_timer_irq (1'b0)
-    );
-
-    // -----------------------------------------------------------------------
-    // GF180 1024×8 SRAM
-    // -----------------------------------------------------------------------
-    gf180mcu_fd_ip_sram__sram1024x8m8wm1 sram_inst (
-        .CLK (clk),
-        .CEN (~sram_active),  // Active-LOW chip enable
-        .GWEN(~sram_write),   // Active-LOW global write enable
-        .WEN (8'b0),          // All byte lanes active when GWEN asserted
-        .A   (final_a),
-        .D   (final_d),
-        .Q   (sram_rdata),
-        .VDD (),
-        .VSS ()
     );
 
     // -----------------------------------------------------------------------
@@ -257,5 +243,10 @@ module mesh_tile #(
         .ne_in(ne_in),  .nw_in(nw_in),  .se_in(se_in),  .sw_in(sw_in),
         .ne_out(ne_out),.nw_out(nw_out),.se_out(se_out),.sw_out(sw_out)
     );
-  assign rd_data = 8'b0;
+
+    // Readback stub — inactive in tapeout
+    assign rd_data = 8'b0;
+
 endmodule
+
+`default_nettype wire

@@ -250,7 +250,12 @@ module chip_core #(
 
         .tile_rd_req_0(1'b0), .tile_rd_req_1(1'b0), .tile_rd_req_2(1'b0),
         .tile_rd_req_3(1'b0), .tile_rd_req_4(1'b0), .tile_rd_req_5(1'b0),
-        .tile_rd_req_6(1'b0), .tile_rd_req_7(1'b0), .tile_rd_req_8(1'b0)
+        .tile_rd_req_6(1'b0), .tile_rd_req_7(1'b0), .tile_rd_req_8(1'b0),
+
+        // readback outputs explicitly left open to satisfy Verilator
+        .tile_rd_data_0(), .tile_rd_data_1(), .tile_rd_data_2(),
+        .tile_rd_data_3(), .tile_rd_data_4(), .tile_rd_data_5(),
+        .tile_rd_data_6(), .tile_rd_data_7(), .tile_rd_data_8()
         // tile_rd_data_* outputs left unconnected (not needed)
     );
 
